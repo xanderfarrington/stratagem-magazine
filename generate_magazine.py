@@ -1,13 +1,18 @@
 import os
 import re
-import requests
+import html
+import feedparser
 from bs4 import BeautifulSoup
 from jinja2 import Template
 from playwright.sync_api import sync_playwright
 
+RSS_FEED_URL = "https://stratageminitiative.substack.com/feed"
 OUTPUT_DIR = "output"
 HTML_FILE = f"{OUTPUT_DIR}/magazine.html"
 PDF_FILE = f"{OUTPUT_DIR}/stratagem_magazine.pdf"
+
+MAX_ARTICLES = 5
+FILTER_KEYWORD = "Deep Dive"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -16,54 +21,69 @@ def clean_text(text):
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def scrape_substack_article(url):
-    from playwright.sync_api import sync_playwright
+def extract_article_content(entry):
+    raw_html = ""
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
-        )
+    if "content" in entry and entry.content:
+        raw_html = entry.content[0].value
+    elif "summary" in entry:
+        raw_html = entry.summary
 
-        page.goto(url, wait_until="networkidle", timeout=60000)
-        html = page.content()
-        browser.close()
+    soup = BeautifulSoup(raw_html, "html.parser")
 
-    soup = BeautifulSoup(html, "html.parser")
+    content = []
 
-    title = soup.find("h1")
-    title = clean_text(title.get_text()) if title else "Untitled Article"
-
-    subtitle_tag = soup.find("h3")
-    subtitle = clean_text(subtitle_tag.get_text()) if subtitle_tag else ""
-
-    article = soup.find("article")
-    if not article:
-        article = soup
-
-    paragraphs = []
-    for tag in article.find_all(["p", "h2", "h3", "blockquote", "li"]):
-        text = clean_text(tag.get_text())
+    for tag in soup.find_all(["p", "h2", "h3", "blockquote", "li"]):
+        text = clean_text(tag.get_text(" "))
         if not text:
             continue
 
         if tag.name == "h2":
-            paragraphs.append({"type": "heading", "text": text})
+            content.append({"type": "heading", "text": text})
         elif tag.name == "h3":
-            paragraphs.append({"type": "subheading", "text": text})
+            content.append({"type": "subheading", "text": text})
         elif tag.name == "blockquote":
-            paragraphs.append({"type": "quote", "text": text})
+            content.append({"type": "quote", "text": text})
         elif tag.name == "li":
-            paragraphs.append({"type": "bullet", "text": text})
+            content.append({"type": "bullet", "text": text})
         else:
-            paragraphs.append({"type": "paragraph", "text": text})
+            content.append({"type": "paragraph", "text": text})
 
-    return {
-        "url": url,
-        "title": title,
-        "subtitle": subtitle,
-        "content": paragraphs
-    }
+    return content
+
+
+def load_articles_from_rss():
+    feed = feedparser.parse(RSS_FEED_URL)
+
+    if feed.bozo:
+        raise RuntimeError(f"RSS feed error: {feed.bozo_exception}")
+
+    articles = []
+
+    for entry in feed.entries:
+        title = clean_text(html.unescape(entry.get("title", "Untitled Article")))
+
+        if FILTER_KEYWORD.lower() not in title.lower():
+            continue
+
+        article = {
+            "title": title,
+            "subtitle": clean_text(entry.get("summary", "")),
+            "author": clean_text(entry.get("author", "")),
+            "date": clean_text(entry.get("published", "")),
+            "url": entry.get("link", ""),
+            "content": extract_article_content(entry),
+        }
+
+        articles.append(article)
+
+        if len(articles) >= MAX_ARTICLES:
+            break
+
+    if not articles:
+        raise ValueError("No Deep Dive articles found in RSS feed.")
+
+    return articles
 
 
 MAGAZINE_TEMPLATE = """
@@ -113,7 +133,7 @@ MAGAZINE_TEMPLATE = """
       font-family: Arial, sans-serif;
       font-size: 16px;
       margin-top: 28px;
-      max-width: 500px;
+      max-width: 520px;
     }
 
     .toc {
@@ -141,7 +161,7 @@ MAGAZINE_TEMPLATE = """
       padding-bottom: 18px;
     }
 
-    .article-header .label {
+    .label {
       font-family: Arial, sans-serif;
       text-transform: uppercase;
       letter-spacing: 0.12em;
@@ -155,9 +175,16 @@ MAGAZINE_TEMPLATE = """
       margin: 0 0 12px 0;
     }
 
+    .meta {
+      font-family: Arial, sans-serif;
+      font-size: 11px;
+      color: #555;
+      margin-bottom: 10px;
+    }
+
     .subtitle {
       font-family: Arial, sans-serif;
-      font-size: 17px;
+      font-size: 16px;
       color: #444;
     }
 
@@ -198,10 +225,6 @@ MAGAZINE_TEMPLATE = """
       font-style: italic;
     }
 
-    ul {
-      margin-top: 0;
-    }
-
     .source {
       margin-top: 28px;
       font-family: Arial, sans-serif;
@@ -217,15 +240,13 @@ MAGAZINE_TEMPLATE = """
   <section class="cover">
     <div class="kicker">The Stratagem Initiative</div>
     <h1>Deep Dive<br>Magazine</h1>
-    <p>A print-ready collection of Stratagem Deep Dive articles, automatically formatted from Substack.</p>
+    <p>A print-ready collection of Stratagem Deep Dive articles, automatically formatted from Substack RSS.</p>
   </section>
 
   <section class="toc">
     <h1>Contents</h1>
     {% for article in articles %}
-      <div class="toc-item">
-        {{ loop.index }}. {{ article.title }}
-      </div>
+      <div class="toc-item">{{ loop.index }}. {{ article.title }}</div>
     {% endfor %}
   </section>
 
@@ -234,9 +255,10 @@ MAGAZINE_TEMPLATE = """
       <div class="article-header">
         <div class="label">Deep Dive</div>
         <h1>{{ article.title }}</h1>
-        {% if article.subtitle %}
-          <div class="subtitle">{{ article.subtitle }}</div>
-        {% endif %}
+        <div class="meta">
+          {% if article.author %}{{ article.author }}{% endif %}
+          {% if article.date %} · {{ article.date }}{% endif %}
+        </div>
       </div>
 
       <div class="article-body">
@@ -248,7 +270,7 @@ MAGAZINE_TEMPLATE = """
           {% elif item.type == "quote" %}
             <blockquote>{{ item.text }}</blockquote>
           {% elif item.type == "bullet" %}
-            <ul><li>{{ item.text }}</li></ul>
+            <p>• {{ item.text }}</p>
           {% else %}
             <p>{{ item.text }}</p>
           {% endif %}
@@ -264,29 +286,19 @@ MAGAZINE_TEMPLATE = """
 """
 
 
-def load_urls():
-    with open("article_urls.txt", "r", encoding="utf-8") as f:
-        return [
-            line.strip()
-            for line in f.readlines()
-            if line.strip() and not line.startswith("#")
-        ]
-
-
 def render_html(articles):
     template = Template(MAGAZINE_TEMPLATE)
-    html = template.render(articles=articles)
+    html_output = template.render(articles=articles)
 
     with open(HTML_FILE, "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(html_output)
 
 
 def export_pdf():
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
-
-        page.goto(f"file://{os.path.abspath(HTML_FILE)}", wait_until="networkidle")
+        page.goto(f"file://{os.path.abspath(HTML_FILE)}", wait_until="load")
 
         page.pdf(
             path=PDF_FILE,
@@ -297,25 +309,14 @@ def export_pdf():
                 "right": "0.7in",
                 "bottom": "0.7in",
                 "left": "0.7in",
-            }
+            },
         )
 
         browser.close()
 
 
 def main():
-    urls = load_urls()
-
-    if not urls:
-        raise ValueError("No article URLs found in article_urls.txt")
-
-    articles = []
-
-    for url in urls:
-        print(f"Scraping: {url}")
-        article = scrape_substack_article(url)
-        articles.append(article)
-
+    articles = load_articles_from_rss()
     render_html(articles)
     export_pdf()
 
