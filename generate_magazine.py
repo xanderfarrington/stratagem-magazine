@@ -55,8 +55,9 @@ def extract_article_content(entry):
 def load_articles_from_rss():
     feed = feedparser.parse(RSS_FEED_URL)
 
-    if feed.bozo:
-        raise RuntimeError(f"RSS feed error: {feed.bozo_exception}")
+  # Substack RSS is often slightly malformed — ignore minor parsing errors
+if feed.bozo:
+    print("Warning: RSS feed parsing issue, continuing anyway...")
 
     articles = []
 
