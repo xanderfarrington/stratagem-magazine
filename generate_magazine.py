@@ -17,14 +17,19 @@ def clean_text(text):
 
 
 def scrape_substack_article(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    from playwright.sync_api import sync_playwright
 
-    response = requests.get(url, headers=headers, timeout=20)
-    response.raise_for_status()
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+        )
 
-    soup = BeautifulSoup(response.text, "html.parser")
+        page.goto(url, wait_until="networkidle", timeout=60000)
+        html = page.content()
+        browser.close()
+
+    soup = BeautifulSoup(html, "html.parser")
 
     title = soup.find("h1")
     title = clean_text(title.get_text()) if title else "Untitled Article"
